@@ -1,0 +1,616 @@
+import asyncio
+import os
+from datetime import datetime
+from ..api.game_api import GameAPI
+from ..data.runtime_paths import get_runtime_debug_dir
+from ..data.storage import Storage
+from astrbot.api.message_components import Plain
+from astrbot.api import logger
+
+try:
+    from astrbot.api.event import MessageChain
+except Exception:
+    MessageChain = None
+
+
+
+class RedDetector:
+    def __init__(self, storage: Storage, context):
+        self.storage = storage
+        self.api = GameAPI()
+        self.context = context
+        self.check_counters = {}
+        self.debug_dir = get_runtime_debug_dir()
+
+    def write_debug_file(self, filename, content):
+        path = os.path.join(self.debug_dir, filename)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return path
+
+    def get_runtime_debug_dir(self):
+        return self.debug_dir
+
+    @staticmethod
+    def _normalize_text_value(value):
+        if value is None or isinstance(value, (dict, list, tuple, set)):
+            return ""
+        text = str(value).strip()
+        if not text or text.lower() in {"none", "null", "unknown"}:
+            return ""
+        return text
+
+    @classmethod
+    def _deep_find_text(cls, source, exact_keys=None, fuzzy_tokens=None):
+        exact_keys = tuple(exact_keys or ())
+        fuzzy_tokens = tuple(fuzzy_tokens or ())
+
+        if isinstance(source, dict):
+            for key in exact_keys:
+                value = cls._normalize_text_value(source.get(key))
+                if value:
+                    return value
+
+            for key, value in source.items():
+                key_text = str(key).lower()
+                if fuzzy_tokens and any(token in key_text for token in fuzzy_tokens) and not key_text.endswith("id"):
+                    text = cls._normalize_text_value(value)
+                    if text:
+                        return text
+                nested = cls._deep_find_text(value, exact_keys=exact_keys, fuzzy_tokens=fuzzy_tokens)
+                if nested:
+                    return nested
+
+        elif isinstance(source, list):
+            for item in source:
+                nested = cls._deep_find_text(item, exact_keys=exact_keys, fuzzy_tokens=fuzzy_tokens)
+                if nested:
+                    return nested
+
+        return ""
+
+    @classmethod
+    def _extract_map_name(cls, *sources):
+        exact_keys = (
+            "map_name",
+            "MapName",
+            "mapName",
+            "sMapName",
+            "Map",
+            "map",
+            "BattlefieldName",
+            "battlefieldName",
+            "SceneName",
+            "sceneName",
+            "PlaceName",
+            "placeName",
+        )
+        fuzzy_tokens = ("map", "scene", "place", "battlefield")
+        for source in sources:
+            value = cls._deep_find_text(source, exact_keys=exact_keys, fuzzy_tokens=fuzzy_tokens)
+            if value:
+                return value
+        return ""
+
+    @classmethod
+    def _extract_role_id(cls, *sources):
+        exact_keys = (
+            "role_id",
+            "roleId",
+            "RoleId",
+            "sRoleId",
+            "charId",
+            "CharId",
+        )
+        for source in sources:
+            value = cls._deep_find_text(source, exact_keys=exact_keys)
+            if value:
+                return value
+        return ""
+
+    @staticmethod
+    def _format_item_names(detected_items, limit=3):
+        names = [str(item.get("name", "")).strip() for item in detected_items if str(item.get("name", "")).strip()]
+        if not names:
+            return "未知物品"
+        if len(names) <= limit:
+            return "、".join(names)
+        return f"{'、'.join(names[:limit])}等{len(names)}件物品"
+
+    async def ensure_user_role_id(self, sender_id, user_data, match_info=None):
+        role_id = str(user_data.get("role_id", "")).strip()
+        if not role_id and match_info:
+            role_id = self._extract_role_id(match_info)
+
+        if role_id:
+            if user_data.get("role_id") != role_id:
+                self.storage.update_user_state(sender_id, "role_id", role_id)
+                user_data["role_id"] = role_id
+            return role_id
+
+        openid = user_data.get("openid")
+        access_token = user_data.get("access_token")
+        platform = user_data.get("platform", "qq")
+        if not openid or not access_token:
+            return ""
+
+        try:
+            api = GameAPI(platform)
+            bind_res = await api.bind_account(access_token, openid, platform)
+            role_id = str(bind_res.get("data", {}).get("role_id", "")).strip()
+            if role_id:
+                self.storage.update_user_state(sender_id, "role_id", role_id)
+                user_data["role_id"] = role_id
+            return role_id
+        except Exception as e:
+            logger.debug(f"Failed to ensure role_id for {sender_id}: {type(e).__name__}: {e}")
+            return ""
+
+    async def _enrich_match_info(self, openid, access_token, match_info):
+        if not isinstance(match_info, dict):
+            return match_info
+
+        enriched = dict(match_info)
+        map_name = self._extract_map_name(enriched)
+        role_id = self._extract_role_id(enriched)
+        if map_name:
+            enriched["map_name"] = map_name
+        if role_id:
+            enriched["role_id"] = role_id
+        if map_name and role_id:
+            return enriched
+
+        room_id = self._extract_room_id(enriched)
+        if not room_id:
+            return enriched
+
+        try:
+            room_info = await self.api.fetch_room_info(openid, access_token, room_id)
+            room_flow = await self.api.fetch_room_flow(openid, access_token, room_id, type_id=1)
+        except Exception as e:
+            logger.debug(f"Failed to enrich match info for room {room_id}: {type(e).__name__}: {e}")
+            return enriched
+
+        if room_info:
+            enriched["room_info"] = room_info
+        if room_flow:
+            enriched["room_flow"] = room_flow
+
+        map_name = self._extract_map_name(enriched, room_info, room_flow)
+        role_id = self._extract_role_id(enriched, room_info, room_flow)
+        if map_name:
+            enriched["map_name"] = map_name
+        if role_id:
+            enriched["role_id"] = role_id
+        return enriched
+
+    def _build_broadcast_message(self, user_name, detected_items, match_info=None, role_id=""):
+        display_role_id = str(role_id or self._extract_role_id(match_info) or "").strip() or "未记录角色ID"
+        event_time = "未知时间"
+        if isinstance(match_info, dict):
+            event_time = match_info.get("dtEventTime") or match_info.get("event_time") or event_time
+        map_name = self._extract_map_name(match_info) or "未知地图"
+        item_names = self._format_item_names(detected_items)
+        return (
+            "【天降洪福·大红播报】\n"
+            f"恭喜本群【{display_role_id}】长官在 【{event_time}】的【{map_name}】中，将【{item_names}】收入囊中！"
+            "此等欧气，洪福齐天，堪称战场锦鲤，羡煞众人！"
+        )
+
+    async def _send_message_to_origin(self, origin, msg):
+        errors = []
+
+        if MessageChain is not None:
+            try:
+                chain = MessageChain().message(msg)
+                await self.context.send_message(origin, chain)
+                return "MessageChain"
+            except Exception as e:
+                errors.append(f"MessageChain: {type(e).__name__}: {e}")
+
+        try:
+            await self.context.send_message(origin, [Plain(msg)])
+            return "PlainList"
+        except Exception as e:
+            errors.append(f"PlainList: {type(e).__name__}: {e}")
+
+        try:
+            await self.context.send_message(origin, msg)
+            return "RawText"
+        except Exception as e:
+            errors.append(f"RawText: {type(e).__name__}: {e}")
+
+        raise RuntimeError(" | ".join(errors) if errors else "未知发送错误")
+
+    @staticmethod
+    def _parse_time(value):
+        if not value:
+            return None
+        try:
+            return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return None
+
+    @staticmethod
+    def _safe_int(value, default=0):
+        try:
+            return int(float(str(value)))
+        except Exception:
+            return default
+
+    @staticmethod
+    def _is_positive_change(change_value):
+        try:
+            return float(str(change_value)) > 0
+        except Exception:
+            return str(change_value).startswith("+")
+
+    def _match_time_window(self, match_time, item_time, seconds=300):
+        match_dt = self._parse_time(match_time)
+        item_dt = self._parse_time(item_time)
+        if not match_dt or not item_dt:
+            return False
+        return abs((item_dt - match_dt).total_seconds()) <= seconds
+
+    @staticmethod
+    def _extract_category_fields(info):
+        if not isinstance(info, dict):
+            return []
+        fields = []
+        props_detail = info.get("propsDetail") if isinstance(info.get("propsDetail"), dict) else {}
+        for key in ["primary", "second", "type", "subType", "category", "objectType", "itemType", "primaryClass", "secondClass", "secondClassCN", "thirdClass", "thirdClassCN"]:
+            value = info.get(key)
+            if value is not None:
+                fields.append(str(value).lower())
+        for key in ["type", "propsSource", "useMap", "usePlace"]:
+            value = props_detail.get(key)
+            if value is not None:
+                fields.append(str(value).lower())
+        return fields
+
+    def _is_collection_item(self, info):
+        if not isinstance(info, dict):
+            return False
+        primary_class = str(info.get("primaryClass", "")).lower()
+        second_class = str(info.get("secondClass", "")).lower()
+        grade = self._safe_int(info.get("grade", 0))
+        return primary_class == "props" and second_class == "collection" and grade == 6
+
+    @staticmethod
+    def _summarize_flow_buckets(item_flows):
+        summary = {
+            "撤离带出+": 0,
+            "撤离带出-": 0,
+            "带入局内+": 0,
+            "带入局内-": 0,
+            "其他+": 0,
+            "其他-": 0,
+        }
+        for item in item_flows:
+            reason = str(item.get("Reason", ""))
+            is_positive = RedDetector._is_positive_change(item.get("AddOrReduce", "0"))
+            if "撤离带出" in reason:
+                summary["撤离带出+" if is_positive else "撤离带出-"] += 1
+            elif "带入局内" in reason:
+                summary["带入局内+" if is_positive else "带入局内-"] += 1
+            else:
+                summary["其他+" if is_positive else "其他-"] += 1
+        return summary
+
+    def _build_flow_key(self, item):
+        return "|".join([
+            str(item.get("dtEventTime", "")),
+            str(item.get("iGoodsId", "")),
+            str(item.get("AddOrReduce", "")),
+            str(item.get("Reason", "")),
+        ])
+
+    def _collect_match_window_items(self, item_flows, match_time, reason_keyword, positive_change, seconds=1800):
+        result = []
+        for item in item_flows:
+            reason = str(item.get("Reason", ""))
+            if reason_keyword not in reason:
+                continue
+            is_positive = self._is_positive_change(item.get("AddOrReduce", "0"))
+            if is_positive != positive_change:
+                continue
+            if match_time and not self._match_time_window(match_time, item.get("dtEventTime", ""), seconds=seconds):
+                continue
+            result.append(item)
+        return result
+
+    def _collect_reason_items(self, item_flows, reason_keyword, positive_change):
+        result = []
+        for item in item_flows:
+            reason = str(item.get("Reason", ""))
+            if reason_keyword not in reason:
+                continue
+            is_positive = self._is_positive_change(item.get("AddOrReduce", "0"))
+            if is_positive != positive_change:
+                continue
+            result.append(item)
+        return result
+
+    def _extract_room_id(self, match):
+        if not isinstance(match, dict):
+            return ""
+        return str(match.get("roomId") or match.get("RoomId") or "")
+
+    async def _get_item_catalog_map(self, openid, access_token):
+        items = await self.api.fetch_item_catalog(openid, access_token)
+        info_map = {}
+        for info in items:
+            if not isinstance(info, dict):
+                continue
+            key = str(info.get("objectID") or info.get("item_id") or info.get("id") or "")
+            if key:
+                info_map[key] = info
+        return info_map
+
+    async def build_debug_report(self, openid, access_token):
+        logs_v2 = await self.api.fetch_records_v2(openid, access_token, type_id=4)
+        latest_match = logs_v2[0] if logs_v2 else None
+        if not latest_match:
+            logs = await self.api.fetch_records(openid, access_token, type_id=4)
+            latest_match = logs[0] if logs else None
+        if not latest_match:
+            return {"error": "未获取到最新战绩"}
+
+        current_match_time = latest_match.get("dtEventTime", "")
+        current_room_id = self._extract_room_id(latest_match)
+        item_flows = await self.api.fetch_all_item_flows(openid, access_token)
+
+        all_carry_out_items = self._collect_reason_items(
+            item_flows,
+            reason_keyword="撤离带出",
+            positive_change=True,
+        )
+        carry_out_items = self._collect_match_window_items(
+            item_flows,
+            current_match_time,
+            reason_keyword="撤离带出",
+            positive_change=True,
+            seconds=420,
+        )
+        filtered_flow_items = list(carry_out_items)
+
+        info_map = await self._get_item_catalog_map(openid, access_token)
+
+        collection_candidates = []
+        for item in filtered_flow_items:
+            item_id = str(item.get("iGoodsId", ""))
+            info = info_map.get(item_id, {})
+            collection_candidates.append({
+                "id": item_id,
+                "name": item.get("Name", ""),
+                "time": item.get("dtEventTime", ""),
+                "change": item.get("AddOrReduce", ""),
+                "reason": item.get("Reason", ""),
+                "is_collection": self._is_collection_item(info),
+                "grade": self._safe_int(info.get("grade", 0)),
+                "category_fields": self._extract_category_fields(info),
+            })
+
+        return {
+            "match": {
+                "room_id": current_room_id,
+                "event_time": current_match_time,
+                "final_price": latest_match.get("FinalPrice", "0"),
+                "escape_reason": latest_match.get("EscapeFailReason", ""),
+            },
+            "flow_summary": self._summarize_flow_buckets(item_flows),
+            "total_item_flows": len(item_flows),
+            "all_carry_out_items": all_carry_out_items,
+            "all_carry_in_items": [],
+            "carry_out_items": carry_out_items,
+            "collection_candidates": collection_candidates,
+        }
+
+    async def build_latest_broadcast_payload(self, openid, access_token):
+        logs_v2 = await self.api.fetch_records_v2(openid, access_token, type_id=4)
+        latest_match = logs_v2[0] if logs_v2 else None
+        if not latest_match:
+            logs = await self.api.fetch_records(openid, access_token, type_id=4)
+            latest_match = logs[0] if logs else None
+        if not latest_match:
+            return {"error": "未获取到最近一局战绩"}
+
+        current_match_time = latest_match.get("dtEventTime", "")
+        current_room_id = self._extract_room_id(latest_match)
+        item_flows = await self.api.fetch_all_item_flows(openid, access_token)
+        if not item_flows:
+            return {"error": "未获取到道具流水"}
+
+        carry_out_items = self._collect_match_window_items(
+            item_flows,
+            current_match_time,
+            reason_keyword="撤离带出",
+            positive_change=True,
+            seconds=420,
+        )
+        filtered_flow_items = list(carry_out_items)
+
+        info_map = await self._get_item_catalog_map(openid, access_token)
+        detected_items = []
+        for item in filtered_flow_items:
+            item_id = str(item.get("iGoodsId", ""))
+            info = info_map.get(item_id, {})
+            if not self._is_collection_item(info):
+                continue
+            detected_items.append({
+                "id": item_id,
+                "name": item.get("Name") or info.get("name") or f"未知物品({item_id})",
+                "time": item.get("dtEventTime", ""),
+                "change": item.get("AddOrReduce", "+0"),
+                "reason": item.get("Reason", ""),
+            })
+
+        detected_items.sort(key=lambda x: x.get("name", ""))
+        latest_match = await self._enrich_match_info(openid, access_token, latest_match)
+
+        return {
+            "match_info": latest_match,
+            "detected_items": detected_items,
+        }
+
+    async def check_all_users(self):
+        users = self.storage.get_users()
+        for sender_id, user_data in users.items():
+            await self.check_user(sender_id, user_data)
+
+    async def check_user(self, sender_id, user_data):
+        openid = user_data.get("openid")
+        access_token = user_data.get("access_token")
+        platform = user_data.get("platform", "qq")
+        if not openid or not access_token:
+            return
+
+        try:
+            self.api.platform = platform
+            counter = self.check_counters.get(sender_id, 0)
+            self.check_counters[sender_id] = counter + 1
+            latest_match = None
+            logs_v2 = await self.api.fetch_records_v2(openid, access_token, type_id=4)
+            if logs_v2 and isinstance(logs_v2, list):
+                latest_match = logs_v2[0]
+            if not latest_match:
+                logs = await self.api.fetch_records(openid, access_token, type_id=4)
+                if logs and isinstance(logs, list):
+                    latest_match = logs[0]
+
+            if not latest_match:
+                return
+
+            current_match_time = latest_match.get("dtEventTime", "")
+            current_room_id = self._extract_room_id(latest_match)
+            last_match_time = user_data.get("last_match_time", "")
+            last_room_id = str(user_data.get("last_room_id", "") or "")
+            last_item_flow_keys = set(user_data.get("last_item_flow_keys", []))
+
+            match_updated = False
+            if current_room_id:
+                match_updated = current_room_id != last_room_id
+            elif current_match_time:
+                match_updated = current_match_time != last_match_time
+
+            should_check_flow = match_updated or counter % 15 == 0 or not last_item_flow_keys
+            if not should_check_flow:
+                return
+
+            item_flows = await self.api.fetch_all_item_flows(openid, access_token)
+            if not item_flows:
+                return
+
+            current_flow_keys = [self._build_flow_key(item) for item in item_flows[:200]]
+
+            if not last_item_flow_keys:
+                self.storage.update_user_state(sender_id, "last_item_flow_keys", current_flow_keys)
+                self.storage.update_user_state(sender_id, "last_match_time", current_match_time)
+                self.storage.update_user_state(sender_id, "last_room_id", current_room_id)
+                logger.info(f"玩家 {sender_id} 首次加载道具流水基线完成。({len(current_flow_keys)}项)")
+                return
+
+            new_flow_items = []
+            for item in item_flows:
+                flow_key = self._build_flow_key(item)
+                if flow_key in last_item_flow_keys:
+                    continue
+                new_flow_items.append(item)
+
+            carry_out_items = self._collect_match_window_items(
+                new_flow_items,
+                current_match_time,
+                reason_keyword="撤离带出",
+                positive_change=True,
+                seconds=420,
+            )
+            filtered_flow_items = list(carry_out_items)
+
+            info_map = await self._get_item_catalog_map(openid, access_token)
+            detected_items = []
+            for item in filtered_flow_items:
+                item_id = str(item.get("iGoodsId", ""))
+                info = info_map.get(item_id, {})
+                display_name = item.get("Name") or info.get("name") or f"未知物品({item_id})"
+                if not self._is_collection_item(info):
+                    continue
+                detected_items.append({
+                    "id": item_id,
+                    "name": display_name,
+                    "time": item.get("dtEventTime", ""),
+                    "change": item.get("AddOrReduce", "+0"),
+                    "reason": item.get("Reason", ""),
+                })
+
+            detected_items.sort(key=lambda x: x.get("name", ""))
+
+            should_advance_state = True
+            if detected_items:
+                latest_match = await self._enrich_match_info(openid, access_token, latest_match)
+                role_id = await self.ensure_user_role_id(sender_id, user_data, match_info=latest_match)
+                broadcast_result = await self.broadcast(
+                    user_data.get("name", sender_id),
+                    detected_items,
+                    latest_match,
+                    role_id=role_id,
+                )
+                if not broadcast_result.get("success_groups"):
+                    logger.warning(
+                        f"玩家 {sender_id} 检测到收集品，但主动播报全部失败。失败目标: "
+                        f"{', '.join(item.get('origin', '') for item in broadcast_result.get('failed_groups', []))}"
+                    )
+                    if broadcast_result.get("total_groups", 0) > 0:
+                        should_advance_state = False
+                        logger.warning(
+                            f"玩家 {sender_id} 的本次收集品播报未成功送达任何已配置群，"
+                            "本轮不会推进流水基线，后续轮询将继续重试。"
+                        )
+
+            if should_advance_state:
+                self.storage.update_user_state(sender_id, "last_item_flow_keys", current_flow_keys)
+                self.storage.update_user_state(sender_id, "last_match_time", current_match_time)
+                self.storage.update_user_state(sender_id, "last_room_id", current_room_id)
+             
+        except Exception as e:
+            logger.error(f"检查玩家 {sender_id} 大红状态时发生错误: {e}")
+
+    async def broadcast(self, user_name, detected_items, match_info=None, role_id=""):
+        groups = [origin for origin in self.storage.get_groups() if origin]
+        msg = self._build_broadcast_message(user_name, detected_items, match_info, role_id=role_id)
+        result = {
+            "message": msg,
+            "total_groups": len(groups),
+            "success_groups": [],
+            "failed_groups": [],
+        }
+
+        logger.info(f"触发大红播报:\n{msg}")
+        try:
+            self.write_debug_file("debug_last_broadcast.txt", msg)
+        except Exception as e:
+            logger.error(f"写入最近播报快照失败: {e}")
+
+        if not groups:
+            return result
+
+        for origin in groups:
+            try:
+                send_mode = await self._send_message_to_origin(origin, msg)
+                result["success_groups"].append({
+                    "origin": origin,
+                    "mode": send_mode,
+                })
+            except Exception as e:
+                error_message = str(e)
+                result["failed_groups"].append({
+                    "origin": origin,
+                    "error": error_message,
+                })
+                logger.error(f"播报到群 {origin} 失败: {error_message}")
+
+        logger.info(
+            f"大红播报结果: 成功 {len(result['success_groups'])}/{len(groups)}，"
+            f"失败 {len(result['failed_groups'])}/{len(groups)}"
+        )
+        return result

@@ -1,0 +1,6 @@
+name: astrbot_plugin_df_red
+display_name: 三角洲大红播报
+desc: 定时查询三角洲行动战绩，并在群内播报获得的大红物品。
+version: v1.0.0
+author: 无赋
+repo: https://github.com/Antigravity/astrbot_plugin_df_red
