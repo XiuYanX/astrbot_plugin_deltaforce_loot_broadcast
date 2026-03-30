@@ -11,7 +11,7 @@ from .monitor.red_detector import RedDetector
 MAX_LOGIN_ATTEMPTS = 120
 LOGIN_ATTEMPT_INTERVAL = 0.5
 
-@register("astrbot_plugin_df_red", "Antigravity", "三角洲行动大红物品播报插件", "1.0.0")
+@register("astrbot_plugin_df_red", "Antigravity", "AstrBot 三角洲物资播报插件", "1.0.0")
 class DeltaForceRedPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
@@ -87,13 +87,13 @@ class DeltaForceRedPlugin(Star):
 
     async def initialize(self):
         """异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
-        logger.info("三角洲大红播报插件初始化...")
-        logger.info(f"三角洲大红播报运行数据目录: {get_runtime_data_dir()}")
+        logger.info("AstrBot 三角洲物资播报插件初始化...")
+        logger.info(f"AstrBot 三角洲物资播报运行数据目录: {get_runtime_data_dir()}")
         self.polling_task = asyncio.create_task(self.start_polling())
 
     async def start_polling(self):
         """后台轮询任务"""
-        logger.info("三角洲大红播报轮询任务已启动")
+        logger.info("AstrBot 三角洲物资播报轮询任务已启动")
         while True:
             try:
                 await self.detector.check_all_users()
@@ -343,4 +343,4 @@ class DeltaForceRedPlugin(Star):
         """插件销毁方法，当插件被卸载/停用时会调用。"""
         if self.polling_task and not self.polling_task.done():
             self.polling_task.cancel()
-        logger.info("三角洲大红播报插件已卸载")
+        logger.info("AstrBot 三角洲物资播报插件已卸载")
