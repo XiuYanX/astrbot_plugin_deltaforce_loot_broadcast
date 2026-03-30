@@ -1,8 +1,11 @@
 import asyncio
+from contextlib import suppress
+
+from astrbot.api import logger
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.message_components import Image
 from astrbot.api.star import Context, Star, register
-from astrbot.api import logger
+
 from .api.game_api import GameAPI
 from .data.runtime_paths import get_runtime_data_dir
 from .data.storage import Storage
@@ -16,16 +19,16 @@ class DeltaForceRedPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
         self.polling_task = None
+        self.command_api = GameAPI("qq")
         self.storage = Storage()
         self.detector = RedDetector(self.storage, context)
 
     async def _finish_bind(self, sender_id: str, user_name: str, platform: str, openid: str, access_token: str):
-        api = GameAPI(platform)
-        bind_res = await api.bind_account(access_token, openid, platform)
+        bind_res = await self.command_api.bind_account(access_token, openid, platform)
         if not bind_res.get("status"):
             return False, bind_res.get("message", "绑定失败")
         role_id = str(bind_res.get("data", {}).get("role_id", "")).strip()
-        self.storage.add_user(
+        await self.storage.add_user(
             sender_id,
             openid,
             access_token,
@@ -37,8 +40,7 @@ class DeltaForceRedPlugin(Star):
         return True, f"绑定成功！已为玩家 {user_name} 开启大红物品监测。平台：{platform.upper()}{role_suffix}"
 
     async def _bind_with_qq_qr(self, event: AstrMessageEvent):
-        api = GameAPI("qq")
-        qr_res = await api.get_qq_login_qr()
+        qr_res = await self.command_api.get_qq_login_qr()
         if not qr_res.get("status"):
             yield event.plain_result(f"❌ 获取QQ二维码失败：{qr_res.get('message', '未知错误')}")
             return
@@ -60,11 +62,11 @@ class DeltaForceRedPlugin(Star):
         login_sig = data.get("loginSig", "")
 
         for _ in range(MAX_LOGIN_ATTEMPTS):
-            status_res = await api.get_login_status(cookie, qr_sig, qr_token, login_sig)
+            status_res = await self.command_api.get_login_status(cookie, qr_sig, qr_token, login_sig)
             code = status_res.get("code")
             if code == 0:
                 cookie = status_res.get("data", {}).get("cookie", cookie)
-                token_res = await api.get_access_token_by_cookie(cookie)
+                token_res = await self.command_api.get_access_token_by_cookie(cookie)
                 if not token_res.get("status"):
                     yield event.plain_result(f"❌ QQ登录成功，但换取令牌失败：{token_res.get('message', '未知错误')}")
                     return
@@ -101,7 +103,7 @@ class DeltaForceRedPlugin(Star):
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"轮询任务异常: {e}")
+                logger.error(f"轮询任务异常: {type(e).__name__}: {e}")
                 await asyncio.sleep(60)
 
     @filter.command("df绑定")
@@ -118,21 +120,21 @@ class DeltaForceRedPlugin(Star):
     async def unbind_account(self, event: AstrMessageEvent):
         """解除绑定三角洲游戏账号"""
         sender_id = event.get_sender_id()
-        self.storage.remove_user(sender_id)
+        await self.storage.remove_user(sender_id)
         yield event.plain_result("解绑成功！已停止您的大红物品监测。")
 
     @filter.command("df设置群")
     async def set_group(self, event: AstrMessageEvent):
         """设置当前群为大红播报群"""
         unified_msg_origin = event.unified_msg_origin
-        self.storage.add_group(unified_msg_origin)
+        await self.storage.add_group(unified_msg_origin)
         yield event.plain_result(f"设置播报群成功！后续大红物品将播报至本群。")
 
     @filter.command("df取消群绑定")
     async def unset_group(self, event: AstrMessageEvent):
         """取消当前群的大红播报绑定"""
         unified_msg_origin = event.unified_msg_origin
-        removed = self.storage.remove_group(unified_msg_origin)
+        removed = await self.storage.remove_group(unified_msg_origin)
         if removed:
             yield event.plain_result("取消群绑定成功！本群后续将不再接收大红物品播报。")
             return
@@ -141,8 +143,8 @@ class DeltaForceRedPlugin(Star):
     @filter.command("df状态")
     async def status(self, event: AstrMessageEvent):
         """查看当前绑定状态与播报群状态"""
-        users = self.storage.get_users()
-        groups = self.storage.get_groups()
+        users = await self.storage.get_users()
+        groups = await self.storage.get_groups()
         sender_id = event.get_sender_id()
         
         bind_status = "已绑定" if sender_id in users else "未绑定"
@@ -155,8 +157,7 @@ class DeltaForceRedPlugin(Star):
     async def refresh_item_catalog(self, event: AstrMessageEvent):
         """强制刷新本地物品缓存"""
         sender_id = event.get_sender_id()
-        users = self.storage.get_users()
-        user_data = users.get(sender_id)
+        user_data = await self.storage.get_user(sender_id)
         if not user_data:
             yield event.plain_result("您还未绑定账号！无法刷新物品缓存。")
             return
@@ -167,8 +168,12 @@ class DeltaForceRedPlugin(Star):
         if platform != "qq":
             yield event.plain_result("当前版本仅支持 QQ 账号检测，请先解绑后重新使用 df绑定。")
             return
-        self.detector.api.platform = platform
-        items = await self.detector.api.fetch_item_catalog(openid, access_token, force_refresh=True)
+        items = await self.detector.api.fetch_item_catalog(
+            openid,
+            access_token,
+            force_refresh=True,
+            platform=platform,
+        )
         if not items:
             yield event.plain_result("❌ 刷新物品缓存失败。")
             return
@@ -178,8 +183,7 @@ class DeltaForceRedPlugin(Star):
     async def check_now(self, event: AstrMessageEvent):
         """直接检查最近一局，并按正式播报逻辑返回结果"""
         sender_id = event.get_sender_id()
-        users = self.storage.get_users()
-        user_data = users.get(sender_id)
+        user_data = await self.storage.get_user(sender_id)
         if not user_data:
             yield event.plain_result("您还未绑定账号！无法进行检测诊断。")
             return
@@ -192,11 +196,14 @@ class DeltaForceRedPlugin(Star):
         if platform != "qq":
             yield event.plain_result("当前版本仅支持 QQ 账号检测，请先解绑后重新使用 df绑定。")
             return
-        self.detector.api.platform = platform
         user_name = user_data.get("name", sender_id)
 
         try:
-            payload = await self.detector.build_latest_broadcast_payload(openid, access_token)
+            payload = await self.detector.build_latest_broadcast_payload(
+                openid,
+                access_token,
+                platform=platform,
+            )
             if payload.get("error"):
                 yield event.plain_result(f"❌ {payload['error']}")
                 return
@@ -208,7 +215,7 @@ class DeltaForceRedPlugin(Star):
                 yield event.plain_result(f"最近一局（{dt}）未检测到带出收集品。")
                 return
 
-            groups = self.storage.get_groups()
+            groups = await self.storage.get_groups()
             if groups:
                 role_id = await self.detector.ensure_user_role_id(sender_id, user_data, match_info=match_info)
                 broadcast_result = await self.detector.broadcast(
@@ -260,8 +267,7 @@ class DeltaForceRedPlugin(Star):
     async def check_debug(self, event: AstrMessageEvent):
         """输出本局带出/收集品判定的详细调试信息"""
         sender_id = event.get_sender_id()
-        users = self.storage.get_users()
-        user_data = users.get(sender_id)
+        user_data = await self.storage.get_user(sender_id)
         if not user_data:
             yield event.plain_result("您还未绑定账号！无法进行详细诊断。")
             return
@@ -274,10 +280,13 @@ class DeltaForceRedPlugin(Star):
         if platform != "qq":
             yield event.plain_result("当前版本仅支持 QQ 账号检测，请先解绑后重新使用 df绑定。")
             return
-        self.detector.api.platform = platform
 
         try:
-            report = await self.detector.build_debug_report(openid, access_token)
+            report = await self.detector.build_debug_report(
+                openid,
+                access_token,
+                platform=platform,
+            )
             if report.get("error"):
                 yield event.plain_result(f"❌ {report['error']}")
                 return
@@ -343,4 +352,8 @@ class DeltaForceRedPlugin(Star):
         """插件销毁方法，当插件被卸载/停用时会调用。"""
         if self.polling_task and not self.polling_task.done():
             self.polling_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self.polling_task
+        await self.detector.close()
+        await self.command_api.close()
         logger.info("AstrBot 三角洲物资播报插件已卸载")

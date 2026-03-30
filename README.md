@@ -54,10 +54,12 @@
 
 - `df_red_data.json`
 - `item_catalog_cache.json`
+- `df_red_secret.key`（仅非 Windows 平台，用于本地加密凭证）
 - `debug/debug_last_report.txt`
 - `debug/debug_last_broadcast.txt`
 
 如果插件从旧版本升级，首次启动时会自动从旧插件名 `astrbot_plugin_df_red` 对应的数据目录迁移绑定与缓存数据。
+其中账号凭证不会再以明文写入 `df_red_data.json`：Windows 平台使用系统 DPAPI 保护，其他平台使用本地生成的对称密钥加密保存。
 
 ## 更新插件
 
@@ -87,7 +89,7 @@
 ## 依赖
 
 ```bash
-pip install aiohttp
+pip install aiohttp cryptography
 ```
 
 AstrBot 相关依赖由运行环境提供。

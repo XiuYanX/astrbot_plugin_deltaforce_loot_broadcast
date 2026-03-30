@@ -1,2 +1,3 @@
 aiohttp
+cryptography
 # AstrBot SDK 由运行环境提供，无需在此声明
