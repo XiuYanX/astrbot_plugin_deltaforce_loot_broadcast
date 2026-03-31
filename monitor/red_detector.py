@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 from datetime import datetime
 from pathlib import Path
 
@@ -18,12 +18,14 @@ ITEM_FLOW_BASELINE_LIMIT = 200
 MAX_PARALLEL_USER_CHECKS = 4
 MAX_PARALLEL_BROADCASTS = 4
 CHECK_USER_TIMEOUT_SECONDS = 45
+MAX_PENDING_BROADCASTS = 20
 
 
 class RedDetector:
     def __init__(self, storage: Storage, context, api=None):
         self.storage = storage
         self.api = api or GameAPI()
+        self._owns_api = api is None
         self.context = context
         self.check_counters = {}
         self.debug_dir = Path(get_runtime_debug_dir())
@@ -31,7 +33,8 @@ class RedDetector:
         self.max_parallel_broadcasts = MAX_PARALLEL_BROADCASTS
 
     async def close(self):
-        await self.api.close()
+        if self._owns_api:
+            await self.api.close()
 
     def write_debug_file(self, filename, content):
         path = self.debug_dir / filename
@@ -46,6 +49,19 @@ class RedDetector:
         self.check_counters.pop(str(sender_id), None)
 
     @staticmethod
+    def _normalize_origin(origin):
+        return str(origin or "").strip()
+
+    @classmethod
+    def _normalize_origins(cls, origins):
+        normalized = []
+        for origin in origins or []:
+            normalized_origin = cls._normalize_origin(origin)
+            if normalized_origin and normalized_origin not in normalized:
+                normalized.append(normalized_origin)
+        return normalized
+
+    @staticmethod
     def _get_flow_window(item_flows, limit=ITEM_FLOW_BASELINE_LIMIT):
         return list(item_flows[:limit])
 
@@ -57,6 +73,81 @@ class RedDetector:
         if not text or text.lower() in {"none", "null", "unknown"}:
             return ""
         return text
+
+    @classmethod
+    def _normalize_pending_broadcasts(cls, pending_broadcasts):
+        normalized = []
+        if not isinstance(pending_broadcasts, list):
+            return normalized
+
+        for entry in pending_broadcasts:
+            if not isinstance(entry, dict):
+                continue
+            message = str(entry.get("message", "")).strip()
+            origins = cls._normalize_origins(entry.get("origins", []))
+            if not message or not origins:
+                continue
+
+            normalized_entry = {
+                "message": message,
+                "origins": origins,
+            }
+            event_time = cls._normalize_text_value(entry.get("event_time"))
+            room_id = cls._normalize_text_value(entry.get("room_id"))
+            if event_time:
+                normalized_entry["event_time"] = event_time
+            if room_id:
+                normalized_entry["room_id"] = room_id
+            normalized.append(normalized_entry)
+
+        return normalized
+
+    @classmethod
+    def _merge_pending_broadcasts(cls, pending_broadcasts, message, failed_groups, match_info=None):
+        normalized_pending = cls._normalize_pending_broadcasts(pending_broadcasts)
+        failed_origins = cls._normalize_origins(
+            item.get("origin", "")
+            for item in failed_groups
+            if isinstance(item, dict)
+        )
+        message_text = str(message or "").strip()
+        if not message_text or not failed_origins:
+            return normalized_pending
+
+        new_entry = {
+            "message": message_text,
+            "origins": failed_origins,
+        }
+        if isinstance(match_info, dict):
+            event_time = cls._normalize_text_value(
+                match_info.get("dtEventTime") or match_info.get("event_time")
+            )
+            room_id = cls._normalize_text_value(
+                match_info.get("roomId") or match_info.get("RoomId")
+            )
+            if event_time:
+                new_entry["event_time"] = event_time
+            if room_id:
+                new_entry["room_id"] = room_id
+
+        for existing in normalized_pending:
+            same_room = new_entry.get("room_id") and new_entry.get("room_id") == existing.get("room_id")
+            same_time = new_entry.get("event_time") and new_entry.get("event_time") == existing.get("event_time")
+            if existing.get("message") == message_text or (same_room and same_time):
+                existing["origins"] = cls._normalize_origins(
+                    [*existing.get("origins", []), *failed_origins]
+                )
+                if new_entry.get("event_time") and not existing.get("event_time"):
+                    existing["event_time"] = new_entry["event_time"]
+                if new_entry.get("room_id") and not existing.get("room_id"):
+                    existing["room_id"] = new_entry["room_id"]
+                break
+        else:
+            normalized_pending.append(new_entry)
+
+        if len(normalized_pending) > MAX_PENDING_BROADCASTS:
+            normalized_pending = normalized_pending[-MAX_PENDING_BROADCASTS:]
+        return normalized_pending
 
     @classmethod
     def _deep_find_text(cls, source, exact_keys=None, fuzzy_tokens=None):
@@ -137,7 +228,7 @@ class RedDetector:
             return "未知物品"
         if len(names) <= limit:
             return "、".join(names)
-        return f"{'、'.join(names[:limit])}等{len(names)}件物品"
+        return f"{'、'.join(names[:limit])} 等 {len(names)} 件物品"
 
     async def ensure_user_role_id(self, sender_id, user_data, match_info=None):
         role_id = str(user_data.get("role_id", "")).strip()
@@ -181,14 +272,35 @@ class RedDetector:
         if not room_id:
             return enriched
 
-        room_info = await self.api.fetch_room_info(openid, access_token, room_id, platform=platform)
-        room_flow = await self.api.fetch_room_flow(
-            openid,
-            access_token,
-            room_id,
-            type_id=1,
-            platform=platform,
+        room_info_result, room_flow_result = await asyncio.gather(
+            self.api.fetch_room_info(openid, access_token, room_id, platform=platform),
+            self.api.fetch_room_flow(
+                openid,
+                access_token,
+                room_id,
+                type_id=1,
+                platform=platform,
+            ),
+            return_exceptions=True,
         )
+
+        room_info = []
+        room_flow = None
+        if isinstance(room_info_result, Exception):
+            logger.warning(
+                f"Failed to enrich room info for room {room_id}: "
+                f"{type(room_info_result).__name__}: {room_info_result}"
+            )
+        else:
+            room_info = room_info_result
+
+        if isinstance(room_flow_result, Exception):
+            logger.warning(
+                f"Failed to enrich room flow for room {room_id}: "
+                f"{type(room_flow_result).__name__}: {room_flow_result}"
+            )
+        else:
+            room_flow = room_flow_result
 
         if room_info:
             enriched["room_info"] = room_info
@@ -213,9 +325,69 @@ class RedDetector:
         item_names = self._format_item_names(detected_items)
         return (
             "【天降洪福大红播报】\n"
-            f"恭喜本群【{display_name} / {display_role_id}】长官在【{event_time}】的【{map_name}】中，将【{item_names}】收入囊中！"
-            "此等欧气，洪福齐天，堪称战场锦鲤，羡煞众人！"
+            f"恭喜本群玩家 {display_name} / {display_role_id} 在 {event_time} 的 {map_name} 中带出了 {item_names}！"
         )
+
+    async def persist_failed_broadcasts(self, sender_id, user_data, broadcast_result, match_info=None):
+        current_pending = self._normalize_pending_broadcasts(user_data.get("pending_broadcasts", []))
+        updated_pending = self._merge_pending_broadcasts(
+            current_pending,
+            broadcast_result.get("message", ""),
+            broadcast_result.get("failed_groups", []),
+            match_info=match_info,
+        )
+        if updated_pending == current_pending:
+            return updated_pending
+
+        await self.storage.update_user_state(sender_id, pending_broadcasts=updated_pending)
+        user_data["pending_broadcasts"] = updated_pending
+        return updated_pending
+
+    async def retry_pending_broadcasts(self, sender_id, user_data):
+        pending_broadcasts = self._normalize_pending_broadcasts(user_data.get("pending_broadcasts", []))
+        if not pending_broadcasts:
+            return False
+
+        active_groups = set(self._normalize_origins(await self.storage.get_groups()))
+        remaining_pending = []
+        changed = False
+
+        for entry in pending_broadcasts:
+            retry_origins = [origin for origin in entry.get("origins", []) if origin in active_groups]
+            if not retry_origins:
+                changed = True
+                continue
+
+            result = await self.broadcast_message(
+                entry["message"],
+                origins=retry_origins,
+                write_debug_snapshot=False,
+                log_prefix="Retrying pending broadcast",
+            )
+            failed_origins = self._normalize_origins(
+                item.get("origin", "")
+                for item in result.get("failed_groups", [])
+                if isinstance(item, dict)
+            )
+            if failed_origins:
+                if failed_origins != retry_origins:
+                    changed = True
+                updated_entry = dict(entry)
+                updated_entry["origins"] = failed_origins
+                remaining_pending.append(updated_entry)
+                continue
+
+            changed = True
+            logger.info(
+                f"Pending broadcast retry completed for user {sender_id} "
+                f"({len(retry_origins)} groups)"
+            )
+
+        if changed or remaining_pending != pending_broadcasts:
+            await self.storage.update_user_state(sender_id, pending_broadcasts=remaining_pending)
+            user_data["pending_broadcasts"] = remaining_pending
+
+        return bool(remaining_pending)
 
     async def _send_message_to_origin(self, origin, msg):
         errors = []
@@ -240,7 +412,7 @@ class RedDetector:
         except Exception as exc:
             errors.append(f"RawText: {type(exc).__name__}: {exc}")
 
-        raise RuntimeError(" | ".join(errors) if errors else "未知发送错误")
+        raise RuntimeError(" | ".join(errors) if errors else "unknown send error")
 
     @staticmethod
     def _parse_time(value):
@@ -371,6 +543,19 @@ class RedDetector:
                 continue
             result.append(item)
         return result
+
+    async def broadcast(self, user_name, detected_items, match_info=None, role_id=""):
+        message = self._build_broadcast_message(
+            user_name,
+            detected_items,
+            match_info,
+            role_id=role_id,
+        )
+        return await self.broadcast_message(
+            message,
+            write_debug_snapshot=True,
+            log_prefix="Triggered collection broadcast",
+        )
 
     def _collect_reason_items(self, item_flows, reason_keyword, positive_change):
         result = []
@@ -527,9 +712,22 @@ class RedDetector:
             async with semaphore:
                 await self.check_user(sender_id, user_data)
 
-        await asyncio.gather(
-            *(run_check(str(sender_id), user_data) for sender_id, user_data in users.items())
+        sender_entries = [
+            (str(sender_id), user_data)
+            for sender_id, user_data in users.items()
+        ]
+        outcomes = await asyncio.gather(
+            *(run_check(sender_id, user_data) for sender_id, user_data in sender_entries),
+            return_exceptions=True,
         )
+        for (sender_id, _), outcome in zip(sender_entries, outcomes):
+            if isinstance(outcome, asyncio.CancelledError):
+                logger.warning(f"User check for {sender_id} was cancelled before completion.")
+            elif isinstance(outcome, Exception):
+                logger.error(
+                    f"Unexpected failure escaped user check for {sender_id}: "
+                    f"{type(outcome).__name__}: {outcome}"
+                )
 
     async def check_user(self, sender_id, user_data):
         sender_id = str(sender_id)
@@ -549,6 +747,9 @@ class RedDetector:
             logger.error(f"Failed to check user {sender_id}: {type(exc).__name__}: {exc}")
 
     async def _check_user_impl(self, sender_id, user_data):
+        if self._normalize_pending_broadcasts(user_data.get("pending_broadcasts", [])):
+            await self.retry_pending_broadcasts(sender_id, user_data)
+
         openid = user_data.get("openid")
         access_token = user_data.get("access_token")
         platform = (user_data.get("platform", "qq") or "qq").strip().lower()
@@ -617,8 +818,8 @@ class RedDetector:
                 last_room_id=current_room_id,
             )
             logger.info(
-                f"玩家 {sender_id} 首次加载道具流水基线完成。"
-                f"({len(current_flow_keys)}项)"
+                f"玩家 {sender_id} 首次加载道具流水基线完成 "
+                f"({len(current_flow_keys)} 项)"
             )
             return
 
@@ -658,7 +859,11 @@ class RedDetector:
             )
 
         detected_items.sort(key=lambda item: item.get("name", ""))
-        should_advance_state = True
+        update_fields = {
+            "last_item_flow_keys": current_flow_keys,
+            "last_match_time": current_match_time,
+            "last_room_id": current_room_id,
+        }
         if detected_items:
             latest_match = await self._enrich_match_info(
                 openid,
@@ -683,36 +888,45 @@ class RedDetector:
                     f"User {sender_id} detected collection items but all broadcasts failed. "
                     f"Targets: {failed_origins or 'unknown'}"
                 )
-                if broadcast_result.get("total_groups", 0) > 0:
-                    should_advance_state = False
-                    logger.warning(
-                        f"User {sender_id} had no successful broadcast targets in this cycle; "
-                        "item-flow baseline will not advance so the next poll can retry."
-                    )
+            if broadcast_result.get("failed_groups"):
+                pending_broadcasts = self._merge_pending_broadcasts(
+                    user_data.get("pending_broadcasts", []),
+                    broadcast_result.get("message", ""),
+                    broadcast_result.get("failed_groups", []),
+                    match_info=latest_match,
+                )
+                update_fields["pending_broadcasts"] = pending_broadcasts
+                user_data["pending_broadcasts"] = pending_broadcasts
+                logger.warning(
+                    f"Queued retry for {len(broadcast_result.get('failed_groups', []))} "
+                    f"failed broadcast targets for user {sender_id}."
+                )
 
-        if should_advance_state:
-            await self.storage.update_user_state(
-                sender_id,
-                last_item_flow_keys=current_flow_keys,
-                last_match_time=current_match_time,
-                last_room_id=current_room_id,
-            )
+        await self.storage.update_user_state(
+            sender_id,
+            **update_fields,
+        )
 
-    async def broadcast(self, user_name, detected_items, match_info=None, role_id=""):
-        groups = [origin for origin in await self.storage.get_groups() if origin]
-        msg = self._build_broadcast_message(user_name, detected_items, match_info, role_id=role_id)
+    async def broadcast_message(self, message, origins=None, *, write_debug_snapshot=False, log_prefix="Broadcasting message"):
+        if origins is None:
+            groups = await self.storage.get_groups()
+        else:
+            groups = origins
+        groups = self._normalize_origins(groups)
         result = {
-            "message": msg,
+            "message": message,
             "total_groups": len(groups),
             "success_groups": [],
             "failed_groups": [],
         }
+        msg = message
 
-        logger.info(f"触发大红播报:\n{msg}")
-        try:
-            self.write_debug_file("debug_last_broadcast.txt", msg)
-        except Exception as exc:
-            logger.error(f"写入最近播报快照失败: {exc}")
+        logger.info(f"{log_prefix}:\n{msg}")
+        if write_debug_snapshot:
+            try:
+                self.write_debug_file("debug_last_broadcast.txt", msg)
+            except Exception as exc:
+                logger.error(f"Failed to write latest broadcast snapshot: {exc}")
 
         if not groups:
             return result
@@ -731,7 +945,7 @@ class RedDetector:
                     raise
                 except Exception as exc:
                     error_message = str(exc)
-                    logger.error(f"播报到群 {origin} 失败: {error_message}")
+                    logger.error(f"Broadcast to group {origin} failed: {error_message}")
                     return False, {
                         "origin": origin,
                         "error": error_message,
@@ -745,7 +959,7 @@ class RedDetector:
                 result["failed_groups"].append(payload)
 
         logger.info(
-            f"大红播报结果: 成功 {len(result['success_groups'])}/{len(groups)}，"
-            f"失败 {len(result['failed_groups'])}/{len(groups)}"
+            f"{log_prefix} result: success {len(result['success_groups'])}/{len(groups)}, "
+            f"failed {len(result['failed_groups'])}/{len(groups)}"
         )
         return result

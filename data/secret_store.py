@@ -21,6 +21,10 @@ SECRET_KEY_FILENAME = "df_red_secret.key"
 DPAPI_ENTROPY = b"astrbot_plugin_deltaforce_loot_broadcast"
 
 
+class SecretProtectionError(RuntimeError):
+    pass
+
+
 if os.name == "nt":
     import ctypes
     from ctypes import wintypes
@@ -62,7 +66,7 @@ if os.name == "nt":
 class SecretProtector:
     def __init__(self):
         self._fernet = None
-        self._plaintext_fallback_logged = False
+        self._protection_unavailable_logged = False
         self._legacy_plaintext_value_logged = False
 
     @staticmethod
@@ -180,14 +184,17 @@ class SecretProtector:
             del data_buffer
             del entropy_buffer
 
-    def _log_plaintext_fallback(self, reason):
-        if self._plaintext_fallback_logged:
-            return
-        logger.warning(
-            "Secret protection fallback activated; values will be stored in plaintext "
-            f"until secure storage is available: {reason}"
+    def _raise_protection_unavailable(self, reason):
+        if not self._protection_unavailable_logged:
+            logger.warning(
+                "Secret protection unavailable; refusing to store sensitive values "
+                f"until secure storage is available: {reason}"
+            )
+            self._protection_unavailable_logged = True
+        raise SecretProtectionError(
+            "Secure secret storage is unavailable. Restore DPAPI or install/fix "
+            "the 'cryptography' dependency before saving credentials."
         )
-        self._plaintext_fallback_logged = True
 
     def _log_legacy_plaintext_value(self):
         if self._legacy_plaintext_value_logged:
@@ -249,15 +256,13 @@ class SecretProtector:
             try:
                 encrypted = self._protect_with_dpapi(raw_bytes)
             except OSError as exc:
-                self._log_plaintext_fallback(f"{type(exc).__name__}: {exc}")
-                return text
+                self._raise_protection_unavailable(f"{type(exc).__name__}: {exc}")
             return self._build_secret_value("dpapi", self._encode_payload(encrypted))
 
         try:
             token = self._get_fernet().encrypt(raw_bytes).decode("ascii")
         except (OSError, RuntimeError, ValueError) as exc:
-            self._log_plaintext_fallback(f"{type(exc).__name__}: {exc}")
-            return text
+            self._raise_protection_unavailable(f"{type(exc).__name__}: {exc}")
         return self._build_secret_value("fernet", token)
 
     def unprotect(self, value):

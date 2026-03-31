@@ -5,6 +5,7 @@ import os
 import re
 import tempfile
 import time
+from http.cookies import SimpleCookie
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -42,6 +43,15 @@ REQUEST_EXCEPTIONS = (
     json.JSONDecodeError,
     ValueError,
 )
+ALLOWED_REDIRECT_HOSTS = frozenset(
+    {
+        "graph.qq.com",
+        "milo.qq.com",
+        "ptlogin2.graph.qq.com",
+        "ssl.ptlogin2.qq.com",
+        "xui.ptlogin2.qq.com",
+    }
+)
 
 class GameAPI:
     def __init__(self, platform="qq", timeout=REQUEST_TIMEOUT):
@@ -49,6 +59,13 @@ class GameAPI:
         self.timeout = timeout
         self._session = None
         self._session_lock = asyncio.Lock()
+
+    @staticmethod
+    def _create_cookie_jar():
+        cookie_jar_cls = getattr(aiohttp, "DummyCookieJar", None)
+        if cookie_jar_cls is not None:
+            return cookie_jar_cls()
+        return aiohttp.CookieJar()
 
     async def close(self):
         async with self._session_lock:
@@ -61,7 +78,9 @@ class GameAPI:
             if self._session is None or self._session.closed:
                 self._session = aiohttp.ClientSession(
                     timeout=self.timeout,
-                    cookie_jar=aiohttp.CookieJar(),
+                    # Requests pass cookies explicitly so multiple bound accounts
+                    # do not share implicit session state through one CookieJar.
+                    cookie_jar=self._create_cookie_jar(),
                 )
             return self._session
 
@@ -113,9 +132,45 @@ class GameAPI:
         if isinstance(cookie, dict):
             return {str(k): str(v) for k, v in cookie.items() if v not in ("", None)}
         if isinstance(cookie, str):
-            parsed = GameAPI._safe_json_loads(cookie, {})
+            cookie_text = cookie.strip()
+            if not cookie_text:
+                return {}
+            try:
+                parsed = json.loads(cookie_text)
+            except Exception:
+                parsed = None
             if isinstance(parsed, dict):
                 return {str(k): str(v) for k, v in parsed.items() if v not in ("", None)}
+            if isinstance(parsed, str) and parsed != cookie_text:
+                return GameAPI._parse_cookies(parsed)
+            header_cookies = {}
+            cookie_attributes = {
+                "comment",
+                "domain",
+                "expires",
+                "httponly",
+                "max-age",
+                "path",
+                "samesite",
+                "secure",
+                "version",
+            }
+            for part in cookie_text.split(";"):
+                key, separator, value = part.partition("=")
+                key = key.strip()
+                if not separator or not key or key.lower() in cookie_attributes:
+                    continue
+                header_cookies[key] = value.strip().strip('"')
+            simple_cookie = SimpleCookie()
+            try:
+                simple_cookie.load(cookie_text)
+            except Exception:
+                simple_cookie = None
+            if simple_cookie is not None:
+                for key, morsel in simple_cookie.items():
+                    if morsel.value not in ("", None):
+                        header_cookies[str(key)] = str(morsel.value)
+            return header_cookies
         return {}
 
     @staticmethod
@@ -130,24 +185,30 @@ class GameAPI:
     def _merge_cookies(cls, *cookie_sources):
         merged = {}
         for source in cookie_sources:
-            if isinstance(source, dict):
-                merged.update(cls._parse_cookies(source))
+            merged.update(cls._parse_cookies(source))
         return merged
 
     @classmethod
-    def _snapshot_response(cls, response):
+    def _snapshot_response(cls, response, *, session=None):
         snapshot = {
             "status": response.status,
             "headers": dict(response.headers),
             "cookies": cls._collect_response_cookies(response),
         }
-        try:
-            session_cookies = response._session.cookie_jar.filter_cookies(response.url)
-            for key, morsel in session_cookies.items():
-                snapshot["cookies"][str(key)] = str(morsel.value)
-        except Exception:
-            pass
+        if session is not None:
+            try:
+                session_cookies = session.cookie_jar.filter_cookies(response.url)
+                for key, morsel in session_cookies.items():
+                    snapshot["cookies"][str(key)] = str(morsel.value)
+            except Exception:
+                pass
         return snapshot
+
+    @staticmethod
+    def _is_allowed_redirect_target(url):
+        parsed = urlparse(str(url or ""))
+        hostname = (parsed.hostname or "").lower()
+        return parsed.scheme == "https" and hostname in ALLOWED_REDIRECT_HOSTS
 
     @staticmethod
     def _extract_query_param(url, name):
@@ -193,7 +254,7 @@ class GameAPI:
         session = await self._get_session()
         try:
             async with session.request(method, url, **kwargs) as response:
-                return self._snapshot_response(response), await response.text()
+                return self._snapshot_response(response, session=session), await response.text()
         except REQUEST_EXCEPTIONS as exc:
             logger.warning(f"{error_context}: {type(exc).__name__}: {exc}")
             raise
@@ -202,7 +263,7 @@ class GameAPI:
         session = await self._get_session()
         try:
             async with session.request(method, url, **kwargs) as response:
-                return self._snapshot_response(response), await response.json(content_type=None)
+                return self._snapshot_response(response, session=session), await response.json(content_type=None)
         except REQUEST_EXCEPTIONS as exc:
             logger.warning(f"{error_context}: {type(exc).__name__}: {exc}")
             raise
@@ -211,7 +272,7 @@ class GameAPI:
         session = await self._get_session()
         try:
             async with session.request(method, url, **kwargs) as response:
-                return self._snapshot_response(response), await response.read()
+                return self._snapshot_response(response, session=session), await response.read()
         except REQUEST_EXCEPTIONS as exc:
             logger.warning(f"{error_context}: {type(exc).__name__}: {exc}")
             raise
@@ -451,10 +512,17 @@ class GameAPI:
             return {"code": -4, "message": message, "data": {}}
 
         merged_cookies = self._merge_cookies(cookies, response["cookies"])
+        redirect_url = matches.group(3)
+        if not self._is_allowed_redirect_target(redirect_url):
+            logger.warning(
+                "Rejected unexpected QQ login redirect target while finalizing login status: "
+                f"{redirect_url}"
+            )
+            return {"code": -4, "message": "获取登录状态失败", "data": {}}
         try:
             redirect_response, _ = await self._request_text(
                 "GET",
-                matches.group(3),
+                redirect_url,
                 headers=self._get_headers(),
                 cookies=merged_cookies,
                 error_context="Failed to finalize QQ login status",
@@ -466,10 +534,7 @@ class GameAPI:
         return {"code": 0, "message": "登录成功", "data": {"cookie": all_cookies}}
 
     async def get_access_token_by_cookie(self, cookie):
-        cookie_text = cookie if isinstance(cookie, str) else json.dumps(cookie)
-        if "\\" in cookie_text:
-            cookie_text = cookie_text.replace("\\", "")
-        cookies = self._parse_cookies(cookie_text)
+        cookies = self._parse_cookies(cookie)
         if not cookies:
             return {"status": False, "message": "Cookie无效，请重新扫码登录", "data": {}}
 
@@ -511,6 +576,12 @@ class GameAPI:
         auth_code = self._extract_query_param(location, "code")
         if not auth_code:
             return {"status": False, "message": "Cookie过期，请重新扫码登录", "data": {}}
+        if not self._is_allowed_redirect_target(location):
+            logger.warning(
+                "Rejected unexpected QQ authorize redirect target while exchanging access token: "
+                f"{location}"
+            )
+            return {"status": False, "message": "获取access token失败", "data": {}}
 
         merged_cookies = self._merge_cookies(cookies, response["cookies"])
         try:

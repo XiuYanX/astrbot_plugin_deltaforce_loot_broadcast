@@ -7,7 +7,7 @@ import tempfile
 from astrbot.api import logger
 
 from .runtime_paths import get_runtime_file_path
-from .secret_store import SecretProtector
+from .secret_store import SecretProtectionError, SecretProtector
 
 DEFAULT_STORAGE_DATA = {
     "group_origins": [],
@@ -35,6 +35,12 @@ class Storage:
     @staticmethod
     def _normalize_sender_id(sender_id):
         return str(sender_id)
+
+    @staticmethod
+    def _normalize_group_origin(origin):
+        if origin is None:
+            return ""
+        return str(origin).strip()
 
     def _load_from_disk(self):
         data = copy.deepcopy(DEFAULT_STORAGE_DATA)
@@ -84,12 +90,25 @@ class Storage:
         migrated = False
         normalized = copy.deepcopy(user_data)
 
+        secret_updates = {}
+        try:
+            if "openid" in normalized:
+                secret_updates["openid_secret"] = self.secret_protector.protect(normalized.get("openid", ""))
+            if "access_token" in normalized:
+                secret_updates["access_token_secret"] = self.secret_protector.protect(normalized.get("access_token", ""))
+        except SecretProtectionError as exc:
+            logger.warning(
+                "Secure storage unavailable while migrating persisted credentials in "
+                f"{self.filepath}; keeping legacy plaintext values until the issue is fixed: {exc}"
+            )
+            return normalized, False
+
         if "openid" in normalized:
-            normalized["openid_secret"] = self.secret_protector.protect(normalized.get("openid", ""))
+            normalized["openid_secret"] = secret_updates.get("openid_secret", "")
             normalized.pop("openid", None)
             migrated = True
         if "access_token" in normalized:
-            normalized["access_token_secret"] = self.secret_protector.protect(normalized.get("access_token", ""))
+            normalized["access_token_secret"] = secret_updates.get("access_token_secret", "")
             normalized.pop("access_token", None)
             migrated = True
 
@@ -104,19 +123,30 @@ class Storage:
         return hydrated
 
     def _set_user_secrets(self, user_state, openid=None, access_token=None):
+        secret_updates = {}
+        secret_removals = set()
+
         if openid is not None:
+            secret_removals.add("openid")
             if openid:
-                user_state["openid_secret"] = self.secret_protector.protect(openid)
+                secret_updates["openid_secret"] = self.secret_protector.protect(openid)
             else:
-                user_state.pop("openid_secret", None)
-            user_state.pop("openid", None)
+                secret_updates["openid_secret"] = None
 
         if access_token is not None:
+            secret_removals.add("access_token")
             if access_token:
-                user_state["access_token_secret"] = self.secret_protector.protect(access_token)
+                secret_updates["access_token_secret"] = self.secret_protector.protect(access_token)
             else:
-                user_state.pop("access_token_secret", None)
-            user_state.pop("access_token", None)
+                secret_updates["access_token_secret"] = None
+
+        for field in secret_removals:
+            user_state.pop(field, None)
+        for field, value in secret_updates.items():
+            if value:
+                user_state[field] = value
+            else:
+                user_state.pop(field, None)
 
     @staticmethod
     def _restrict_file_permissions(path):
@@ -172,6 +202,7 @@ class Storage:
                 "last_match_time": user_state.get("last_match_time", ""),
                 "last_room_id": user_state.get("last_room_id", ""),
                 "last_item_flow_keys": list(user_state.get("last_item_flow_keys", [])),
+                "pending_broadcasts": list(user_state.get("pending_broadcasts", [])),
                 "assets": list(user_state.get("assets", [])),
             })
             self._set_user_secrets(user_state, openid=openid, access_token=access_token)
@@ -189,6 +220,9 @@ class Storage:
             return True
 
     async def add_group(self, origin):
+        origin = self._normalize_group_origin(origin)
+        if not origin:
+            return False
         async with self._lock:
             new_data = copy.deepcopy(self.data)
             groups = new_data["group_origins"]
@@ -199,6 +233,9 @@ class Storage:
             return True
 
     async def remove_group(self, origin):
+        origin = self._normalize_group_origin(origin)
+        if not origin:
+            return False
         async with self._lock:
             new_data = copy.deepcopy(self.data)
             groups = new_data["group_origins"]

@@ -8,20 +8,21 @@ from astrbot.api.star import Context, Star, register
 
 from .api.game_api import GameAPI
 from .data.runtime_paths import get_runtime_data_dir
+from .data.secret_store import SecretProtectionError
 from .data.storage import Storage
 from .monitor.red_detector import RedDetector
 
 MAX_LOGIN_ATTEMPTS = 120
 LOGIN_ATTEMPT_INTERVAL = 0.5
 
-@register("astrbot_plugin_deltaforce_loot_broadcast", "XiuYan", "AstrBot 三角洲物资播报插件", "1.0.1")
+@register("astrbot_plugin_deltaforce_loot_broadcast", "XiuYan", "AstrBot 三角洲物资播报插件", "1.0.3")
 class DeltaForceRedPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
         self.polling_task = None
         self.command_api = GameAPI("qq")
         self.storage = Storage()
-        self.detector = RedDetector(self.storage, context)
+        self.detector = RedDetector(self.storage, context, api=self.command_api)
 
     def _log_command_exception(self, command_name: str, sender_id, exc: Exception):
         logger.error(
@@ -34,14 +35,21 @@ class DeltaForceRedPlugin(Star):
         if not bind_res.get("status"):
             return False, bind_res.get("message", "绑定失败")
         role_id = str(bind_res.get("data", {}).get("role_id", "")).strip()
-        await self.storage.add_user(
-            sender_id,
-            openid,
-            access_token,
-            name=user_name,
-            platform=platform,
-            role_id=role_id,
-        )
+        try:
+            await self.storage.add_user(
+                sender_id,
+                openid,
+                access_token,
+                name=user_name,
+                platform=platform,
+                role_id=role_id,
+            )
+        except SecretProtectionError as exc:
+            logger.error(f"Failed to persist bound account for sender {sender_id}: {exc}")
+            return False, "无法安全保存账号凭证，请先修复本地密钥保护后再试。"
+        except OSError as exc:
+            logger.error(f"Failed to persist bound account for sender {sender_id}: {exc}")
+            return False, "绑定信息保存失败，请检查插件运行目录写入权限后重试。"
         role_suffix = f" 角色ID：{role_id}" if role_id else ""
         return True, f"绑定成功！已为玩家 {user_name} 开启大红物品监测。平台：{platform.upper()}{role_suffix}"
 
@@ -129,7 +137,17 @@ class DeltaForceRedPlugin(Star):
     async def unbind_account(self, event: AstrMessageEvent):
         """解除绑定三角洲游戏账号"""
         sender_id = str(event.get_sender_id())
-        await self.storage.remove_user(sender_id)
+        try:
+            removed = await self.storage.remove_user(sender_id)
+        except OSError as exc:
+            logger.error(f"Failed to remove bound account for sender {sender_id}: {exc}")
+            yield event.plain_result("解绑失败，请检查插件运行目录写入权限后重试。")
+            return
+
+        if not removed:
+            yield event.plain_result("当前尚未绑定账号，无需解绑。")
+            return
+
         self.detector.clear_user_runtime_state(sender_id)
         yield event.plain_result("解绑成功！已停止您的大红物品监测。")
 
@@ -137,14 +155,37 @@ class DeltaForceRedPlugin(Star):
     async def set_group(self, event: AstrMessageEvent):
         """设置当前群为大红播报群"""
         unified_msg_origin = event.unified_msg_origin
-        await self.storage.add_group(unified_msg_origin)
-        yield event.plain_result(f"设置播报群成功！后续大红物品将播报至本群。")
+        if not unified_msg_origin:
+            yield event.plain_result("当前会话暂不支持设置为播报群，请在目标群聊中使用该命令。")
+            return
+
+        try:
+            added = await self.storage.add_group(unified_msg_origin)
+        except OSError as exc:
+            logger.error(f"Failed to persist broadcast group {unified_msg_origin}: {exc}")
+            yield event.plain_result("设置播报群失败，请检查插件运行目录写入权限后重试。")
+            return
+
+        if added:
+            yield event.plain_result("设置播报群成功！后续大红物品将播报至本群。")
+            return
+        yield event.plain_result("当前群已经设置为播报群，无需重复设置。")
 
     @filter.command("df取消群绑定")
     async def unset_group(self, event: AstrMessageEvent):
         """取消当前群的大红播报绑定"""
         unified_msg_origin = event.unified_msg_origin
-        removed = await self.storage.remove_group(unified_msg_origin)
+        if not unified_msg_origin:
+            yield event.plain_result("当前会话暂不支持取消播报群绑定，请在目标群聊中使用该命令。")
+            return
+
+        try:
+            removed = await self.storage.remove_group(unified_msg_origin)
+        except OSError as exc:
+            logger.error(f"Failed to remove broadcast group {unified_msg_origin}: {exc}")
+            yield event.plain_result("取消群绑定失败，请检查插件运行目录写入权限后重试。")
+            return
+
         if removed:
             yield event.plain_result("取消群绑定成功！本群后续将不再接收大红物品播报。")
             return
@@ -237,6 +278,18 @@ class DeltaForceRedPlugin(Star):
                 success_groups = broadcast_result.get("success_groups", [])
                 failed_groups = broadcast_result.get("failed_groups", [])
                 total_groups = broadcast_result.get("total_groups", 0)
+                if failed_groups:
+                    try:
+                        await self.detector.persist_failed_broadcasts(
+                            sender_id,
+                            user_data,
+                            broadcast_result,
+                            match_info=match_info,
+                        )
+                    except OSError as exc:
+                        logger.error(
+                            f"Failed to persist pending broadcast retries for sender {sender_id}: {exc}"
+                        )
 
                 if success_groups:
                     yield event.plain_result(
