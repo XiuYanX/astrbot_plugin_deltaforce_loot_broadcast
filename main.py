@@ -203,7 +203,10 @@ class DeltaForceRedPlugin(Star):
                 consecutive_status_failures = 0
                 last_status_error = ""
                 cookie = status_res.get("data", {}).get("cookie", cookie)
-                token_res = await self.command_api.get_access_token_by_cookie(cookie)
+                token_res = await self.command_api.get_access_token_by_cookie(
+                    cookie,
+                    login_config,
+                )
                 if not token_res.get("status"):
                     yield event.plain_result(f"❌ QQ登录成功，但换取令牌失败：{token_res.get('message', '未知错误')}")
                     return

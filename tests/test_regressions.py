@@ -693,6 +693,72 @@ class GameAPIRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["status"])
         self.assertEqual(request_mock.await_count, 1)
 
+    async def test_access_token_exchange_follows_intermediate_redirect_before_extracting_code(self):
+        api = GameAPI()
+        login_config = {
+            "href": "https://xui.ptlogin2.qq.com/cgi-bin/xlogin?appid=716027609",
+        }
+        request_mock = mock.AsyncMock(
+            side_effect=[
+                (
+                    {
+                        "status": 302,
+                        "headers": {
+                            "Location": "https://ssl.ptlogin2.graph.qq.com/check_sig?pttype=1"
+                        },
+                        "cookies": {"pt4_token": "token-1"},
+                    },
+                    "",
+                ),
+                (
+                    {
+                        "status": 302,
+                        "headers": {
+                            "Location": "https://milo.qq.com/comm-htdocs/login/qc_redirect.html?code=abc123"
+                        },
+                        "cookies": {"pt_open": "value-1"},
+                    },
+                    "",
+                ),
+                (
+                    {
+                        "status": 200,
+                        "url": "https://milo.qq.com/comm-htdocs/login/qc_redirect.html?code=abc123",
+                        "headers": {},
+                        "cookies": {"p_uin": "uin-1"},
+                    },
+                    "",
+                ),
+                (
+                    {
+                        "status": 200,
+                        "headers": {},
+                        "cookies": {},
+                    },
+                    'try{miloJsonpCb_86690({"iRet":0,"access_token":"token-ok","expires_in":"7776000","openid":"openid-ok"});}catch(e){}',
+                ),
+            ]
+        )
+
+        with mock.patch.object(api, "_request_text", request_mock):
+            result = await api.get_access_token_by_cookie(
+                {"p_skey": "token"},
+                login_config,
+            )
+
+        self.assertTrue(result["status"])
+        self.assertEqual(result["data"]["access_token"], "token-ok")
+        self.assertEqual(result["data"]["openid"], "openid-ok")
+        self.assertEqual(request_mock.await_count, 4)
+        self.assertEqual(
+            request_mock.await_args_list[0].kwargs["headers"]["Referer"],
+            "https://xui.ptlogin2.qq.com/cgi-bin/xlogin?appid=716027609",
+        )
+        self.assertEqual(
+            request_mock.await_args_list[3].kwargs["params"]["qc_code"],
+            "abc123",
+        )
+
     async def test_access_token_exchange_rejects_untrusted_second_hop_redirect_host(self):
         api = GameAPI()
         request_mock = mock.AsyncMock(
@@ -720,6 +786,39 @@ class GameAPIRegressionTests(unittest.IsolatedAsyncioTestCase):
             result = await api.get_access_token_by_cookie({"p_skey": "token"})
 
         self.assertFalse(result["status"])
+        self.assertEqual(request_mock.await_count, 2)
+
+    async def test_access_token_exchange_reports_missing_auth_code_after_redirect_chain(self):
+        api = GameAPI()
+        request_mock = mock.AsyncMock(
+            side_effect=[
+                (
+                    {
+                        "status": 302,
+                        "headers": {
+                            "Location": "https://ssl.ptlogin2.graph.qq.com/check_sig?pttype=1"
+                        },
+                        "cookies": {},
+                    },
+                    "",
+                ),
+                (
+                    {
+                        "status": 200,
+                        "url": "https://milo.qq.com/comm-htdocs/login/qc_redirect.html",
+                        "headers": {},
+                        "cookies": {},
+                    },
+                    "",
+                ),
+            ]
+        )
+
+        with mock.patch.object(api, "_request_text", request_mock):
+            result = await api.get_access_token_by_cookie({"p_skey": "token"})
+
+        self.assertFalse(result["status"])
+        self.assertEqual(result["message"], "未获取到授权码，请重新扫码登录")
         self.assertEqual(request_mock.await_count, 2)
 
     async def test_access_token_exchange_does_not_swallow_value_error(self):
@@ -1780,6 +1879,10 @@ class MainRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(command_api.get_login_status.await_count, 3)
         self.assertEqual(
             command_api.get_login_status.await_args_list[0].args[4],
+            {"href": "https://xui.ptlogin2.qq.com/cgi-bin/xlogin?appid=716027609"},
+        )
+        self.assertEqual(
+            command_api.get_access_token_by_cookie.await_args.args[1],
             {"href": "https://xui.ptlogin2.qq.com/cgi-bin/xlogin?appid=716027609"},
         )
         self.assertEqual(messages[1], "请打开手机QQ使用摄像头扫码，等待自动绑定。")

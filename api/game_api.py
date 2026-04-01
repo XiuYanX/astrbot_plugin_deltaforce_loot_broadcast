@@ -313,6 +313,7 @@ class GameAPI:
     def _snapshot_response(cls, response, *, session=None):
         snapshot = {
             "status": response.status,
+            "url": str(response.url),
             "headers": dict(response.headers),
             "cookies": cls._collect_response_cookies(response),
         }
@@ -821,13 +822,14 @@ class GameAPI:
         all_cookies = self._merge_cookies(merged_cookies, redirect_response["cookies"])
         return {"code": 0, "message": "登录成功", "data": {"cookie": all_cookies}}
 
-    async def get_access_token_by_cookie(self, cookie):
+    async def get_access_token_by_cookie(self, cookie, login_config=None):
         cookies = self._parse_cookies(cookie)
         if not cookies:
             return {"status": False, "message": "Cookie无效，请重新扫码登录", "data": {}}
 
+        normalized_login_config = self._normalize_qq_login_config(login_config)
         headers = {
-            "referer": "https://xui.ptlogin2.qq.com/",
+            "Referer": self._build_qq_login_headers(normalized_login_config)["Referer"],
             "Content-Type": "application/x-www-form-urlencoded",
             "X-G-TK": str(self._get_gtk(cookies.get("p_skey", ""))),
         }
@@ -862,27 +864,43 @@ class GameAPI:
 
         location = response["headers"].get("Location", "")
         auth_code = self._extract_query_param(location, "code")
-        if not auth_code:
-            return {"status": False, "message": "Cookie过期，请重新扫码登录", "data": {}}
-        if not self._is_allowed_redirect_target(location):
+        merged_cookies = self._merge_cookies(cookies, response["cookies"])
+        if location and not self._is_allowed_redirect_target(location):
             logger.warning(
                 "Rejected unexpected QQ authorize redirect target while exchanging access token: "
                 f"{location}"
             )
             return {"status": False, "message": "获取access token失败", "data": {}}
 
-        merged_cookies = self._merge_cookies(cookies, response["cookies"])
-        try:
-            redirect_response, _ = await self._request_get_with_allowed_redirects(
-                location,
-                headers=headers,
-                cookies=merged_cookies,
-                error_context="Failed to complete QQ authorize redirect",
+        redirect_response = None
+        if location:
+            try:
+                redirect_response, _ = await self._request_get_with_allowed_redirects(
+                    location,
+                    headers=headers,
+                    cookies=merged_cookies,
+                    error_context="Failed to complete QQ authorize redirect",
+                )
+            except REQUEST_EXCEPTIONS:
+                return {"status": False, "message": "获取access token失败", "data": {}}
+            merged_cookies = self._merge_cookies(merged_cookies, redirect_response["cookies"])
+            auth_code = (
+                auth_code
+                or self._extract_query_param(redirect_response.get("url", ""), "code")
+                or self._extract_query_param(
+                    redirect_response.get("headers", {}).get("Location", ""),
+                    "code",
+                )
             )
-        except REQUEST_EXCEPTIONS:
-            return {"status": False, "message": "获取access token失败", "data": {}}
 
-        merged_cookies = self._merge_cookies(merged_cookies, redirect_response["cookies"])
+        if not auth_code:
+            logger.warning(
+                "QQ authorize exchange did not return an auth code. "
+                f"status={response.get('status')} location={location!r} "
+                f"final_url={(redirect_response or {}).get('url', '')!r}"
+            )
+            return {"status": False, "message": "未获取到授权码，请重新扫码登录", "data": {}}
+
         params = {
             "a": "qcCodeToOpenId",
             "qc_code": auth_code,
