@@ -953,15 +953,26 @@ class GameAPIRegressionTests(unittest.IsolatedAsyncioTestCase):
             ]
         )
         redirect_mock = mock.AsyncMock(
-            return_value=(
-                {
-                    "status": 200,
-                    "url": "https://milo.qq.com/comm-htdocs/login/qc_redirect.html?code=legacy123",
-                    "headers": {},
-                    "cookies": {"p_uin": "uin-1"},
-                },
-                "",
-            )
+            side_effect=[
+                (
+                    {
+                        "status": 200,
+                        "url": authorize_url,
+                        "headers": {},
+                        "cookies": {"p_skey": "graph-p-skey"},
+                    },
+                    "Q.isNeedLogin = false;",
+                ),
+                (
+                    {
+                        "status": 200,
+                        "url": "https://milo.qq.com/comm-htdocs/login/qc_redirect.html?code=legacy123",
+                        "headers": {},
+                        "cookies": {"p_uin": "uin-1"},
+                    },
+                    "",
+                ),
+            ]
         )
 
         with (
@@ -980,6 +991,11 @@ class GameAPIRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["status"])
         self.assertEqual(result["data"]["openid"], "openid-ok")
         self.assertEqual(request_mock.await_count, 2)
+        self.assertEqual(redirect_mock.await_count, 2)
+        self.assertEqual(
+            redirect_mock.await_args_list[0].args[0],
+            authorize_url,
+        )
         self.assertEqual(
             request_mock.await_args_list[0].kwargs["headers"]["Referer"],
             authorize_url,

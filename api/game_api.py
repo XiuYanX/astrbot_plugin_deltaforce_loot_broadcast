@@ -446,6 +446,56 @@ class GameAPI:
             },
         }
 
+    async def _refresh_qq_authorize_page_context(self, cookies, login_config=None):
+        current_cookies = self._parse_cookies(cookies)
+        refreshed_login_config = dict(login_config or {})
+        authorize_page_url = self._get_qq_authorize_page_url(refreshed_login_config)
+        try:
+            authorize_page_response, authorize_page_text = await self._request_get_with_allowed_redirects(
+                authorize_page_url,
+                headers=self._get_headers(),
+                cookies=current_cookies,
+                error_context="Failed to refresh QQ authorize page",
+            )
+        except REQUEST_EXCEPTIONS:
+            return {"status": False, "message": "鑾峰彇access token澶辫触", "data": {}}
+
+        merged_cookies = self._merge_cookies(
+            current_cookies,
+            authorize_page_response.get("cookies", {}),
+        )
+        refreshed_authorize_url = self._normalize_message_text(
+            authorize_page_response.get("url")
+        ) or authorize_page_url
+        if self._is_qq_authorize_show_url(refreshed_authorize_url):
+            refreshed_login_config["authorize_url"] = refreshed_authorize_url
+
+        refreshed_authorize_need_login = self._extract_qq_connect_authorize_need_login(
+            authorize_page_text
+        )
+        if (
+            refreshed_authorize_need_login is not None
+            and "authorize_need_login" not in refreshed_login_config
+        ):
+            refreshed_login_config["authorize_need_login"] = refreshed_authorize_need_login
+
+        if refreshed_authorize_need_login is True:
+            logger.warning(
+                "QQ authorize page still reports login required after QR login; "
+                "the graph.qq.com authorization state may not have been established."
+            )
+
+        return {
+            "status": True,
+            "message": "鑾峰彇鎴愬姛",
+            "data": {
+                "cookies": merged_cookies,
+                "login_config": refreshed_login_config,
+                "authorize_need_login": refreshed_authorize_need_login,
+                "authorize_url": refreshed_authorize_url,
+            },
+        }
+
     @classmethod
     def _extract_response_message(cls, payload):
         if not isinstance(payload, dict):
@@ -1144,17 +1194,35 @@ class GameAPI:
             enable_authorize_show_flow = QQ_AUTHORIZE_SHOW_FLOW_ENABLED
 
         if not enable_authorize_show_flow:
+            refreshed_authorize_context = await self._refresh_qq_authorize_page_context(
+                cookies,
+                raw_login_config,
+            )
+            if not refreshed_authorize_context.get("status"):
+                return refreshed_authorize_context
+            refreshed_authorize_data = refreshed_authorize_context.get("data", {})
+            refreshed_cookies = self._merge_cookies(
+                cookies,
+                refreshed_authorize_data.get("cookies", {}),
+            )
+            refreshed_login_config = dict(raw_login_config)
+            refreshed_login_config.update(
+                refreshed_authorize_data.get("login_config", {}) or {}
+            )
             logger.info(
                 "Using legacy QQ authorize exchange flow by default; "
                 "the oauth2.0/show-based flow is disabled."
             )
-            legacy_headers = self._build_legacy_qq_authorize_headers(raw_login_config, cookies)
+            legacy_headers = self._build_legacy_qq_authorize_headers(
+                refreshed_login_config,
+                refreshed_cookies,
+            )
             legacy_form_data = self._build_legacy_qq_authorize_form_data(
-                cookies,
-                raw_login_config,
+                refreshed_cookies,
+                refreshed_login_config,
             )
             exchange_result = await self._perform_qq_authorize_exchange(
-                cookies,
+                refreshed_cookies,
                 legacy_headers,
                 legacy_form_data,
             )
@@ -1162,7 +1230,10 @@ class GameAPI:
                 return exchange_result
             exchange_data = exchange_result.get("data", {})
             auth_code = self._normalize_message_text(exchange_data.get("auth_code"))
-            merged_cookies = self._merge_cookies(cookies, exchange_data.get("cookies", {}))
+            merged_cookies = self._merge_cookies(
+                refreshed_cookies,
+                exchange_data.get("cookies", {}),
+            )
             location = self._normalize_message_text(exchange_data.get("location"))
             response = exchange_data.get("response") or {}
             redirect_response = exchange_data.get("redirect_response") or {}
