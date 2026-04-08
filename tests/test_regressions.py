@@ -500,6 +500,41 @@ class GameAPIRegressionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, "测试消息")
 
+    async def test_fetch_role_profile_keeps_unicode_message_without_latin1_reencode(self):
+        api = GameAPI()
+        with mock.patch.object(
+            api,
+            "_request_text",
+            mock.AsyncMock(
+                return_value=(
+                    {"status": 200, "headers": {}, "cookies": {}},
+                    "{ret:0,msg:'绑定成功，请继续',checkparam:'a|b|role-123'}",
+                )
+            ),
+        ):
+            result = await api._fetch_role_profile("token", "openid", "qc")
+
+        self.assertEqual(result["msg"], "绑定成功，请继续")
+        self.assertEqual(result["role_id"], "role-123")
+
+    async def test_fetch_role_profile_decodes_legacy_gbk_message_when_needed(self):
+        api = GameAPI()
+        mojibake_message = "绑定成功".encode("gbk").decode("latin1")
+        with mock.patch.object(
+            api,
+            "_request_text",
+            mock.AsyncMock(
+                return_value=(
+                    {"status": 200, "headers": {}, "cookies": {}},
+                    "{ret:0,msg:'%s',checkparam:'x|y|role-456'}" % mojibake_message,
+                )
+            ),
+        ):
+            result = await api._fetch_role_profile("token", "openid", "qc")
+
+        self.assertEqual(result["msg"], "绑定成功")
+        self.assertEqual(result["role_id"], "role-456")
+
     def test_allowed_redirect_target_accepts_ssl_ptlogin2_graph_domain(self):
         self.assertTrue(
             GameAPI._is_allowed_redirect_target(

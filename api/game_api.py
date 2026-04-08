@@ -136,6 +136,16 @@ class GameAPI:
             return ""
         return text
 
+    @classmethod
+    def _decode_legacy_gbk_text(cls, value):
+        text = cls._normalize_message_text(value)
+        if not text:
+            return ""
+        try:
+            return text.encode("latin1").decode("gbk")
+        except (UnicodeEncodeError, UnicodeDecodeError, LookupError):
+            return text
+
     @staticmethod
     def _decode_js_string_literal(value):
         text = str(value or "")
@@ -969,10 +979,7 @@ class GameAPI:
         for key, value in pairs:
             value = value.strip("'")
             if key == "msg":
-                try:
-                    role_data[key] = value.encode("latin1").decode("gbk")
-                except (UnicodeDecodeError, LookupError):
-                    role_data[key] = value
+                role_data[key] = self._decode_legacy_gbk_text(value)
             else:
                 role_data[key] = value
 

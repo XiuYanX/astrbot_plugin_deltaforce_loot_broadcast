@@ -20,7 +20,7 @@ MAX_TRANSIENT_LOGIN_STATUS_FAILURES = 12
     "astrbot_plugin_deltaforce_loot_broadcast",
     "XiuYan",
     "AstrBot 三角洲物资播报插件（测试版，QQ 绑定链路仍在验证）",
-    "1.0.14",
+    "1.0.15",
 )
 class DeltaForceRedPlugin(Star):
     def __init__(self, context: Context):
