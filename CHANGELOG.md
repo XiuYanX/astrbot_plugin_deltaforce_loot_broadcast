@@ -6,6 +6,15 @@
 
 - 暂无
 
+## v1.0.16 - 2026-04-08
+
+### 主要更新
+
+- 清理已废弃的 QQ `oauth2.0/show` 授权页实验链路、回退开关和对照代码，运行时只保留当前稳定可用的一条绑定主链路
+- QQ 扫码绑定统一收敛到 `xlogin -> ptqrshow -> ptqrlogin -> authorize -> qcCodeToOpenId`，继续使用独立 CookieJar session 贯穿整条登录与令牌兑换流程
+- 移除测试版标识并恢复正式版本描述，同步更新插件元信息、README 与运行时注册信息
+- 回归测试同步收敛为单链路覆盖，删除已停用分支对应的断言与用例，并在本地验证 `python tests/test_regressions.py` 通过
+
 ## v1.0.15 - 2026-04-08
 
 ### 主要更新

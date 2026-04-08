@@ -19,8 +19,8 @@ MAX_TRANSIENT_LOGIN_STATUS_FAILURES = 12
 @register(
     "astrbot_plugin_deltaforce_loot_broadcast",
     "XiuYan",
-    "AstrBot 三角洲物资播报插件（测试版，QQ 绑定链路仍在验证）",
-    "1.0.15",
+    "AstrBot 三角洲物资播报插件，支持 QQ 扫码绑定、撤离带出检测与高价值收集品播报。",
+    "1.0.16",
 )
 class DeltaForceRedPlugin(Star):
     def __init__(self, context: Context):
